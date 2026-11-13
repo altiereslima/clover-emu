@@ -1,0 +1,18 @@
+# build output
+build/
+
+# Firmware images and extracted firmware (Nintendo copyrighted — never commit)
+*.hsqs
+*.img
+*.bin
+*.sfrom
+*.nes
+firmware/
+
+# runtime state: saves/settings and per-boot tmpfs
+saves/
+run/
+
+# misc
+.DS_Store
+*.log

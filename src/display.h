@@ -35,7 +35,7 @@ bool guest_gl_active();
 void note_fb_activity();
 void note_fb_flip();       // a new framebuffer page was flipped in: present it now
 void wait_vsync_tick();    // block until the next 60 Hz refresh (FBIO_WAITFORVSYNC)
-extern bool g_snes;  // Super NES Classic firmware (extra buttons, title)
+extern bool g_snes;  // Super NES Classic firmware (extra buttons)
 // debug screenshots
 extern std::string g_shot_dir;
 extern std::atomic<bool> g_shot_req;

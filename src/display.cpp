@@ -157,7 +157,7 @@ bool init_window(int scale, bool fullscreen) {
     int w = 1280 * scale / 2, h = 720 * scale / 2;
     u32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-    g_win = SDL_CreateWindow(g_snes ? "Super NES Classic Edition" : "NES Classic Edition", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
+    g_win = SDL_CreateWindow("clover-emu", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
     if (!g_win) {
         LOGI("SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;

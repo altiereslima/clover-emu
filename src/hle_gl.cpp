@@ -1,15 +1,12 @@
 // HLE of OpenGL ES 2.0 (libMali) on top of macOS legacy OpenGL 2.1.
-#define GL_SILENCE_DEPRECATION
 #include "hle.h"
 #include "hle_gl.h"
 #include "display.h"
 #include <SDL.h>
-#include <OpenGL/gl.h>
-#include <OpenGL/glext.h>
+#include "gl_api.h"
 #include <regex>
 #include <map>
 #include <mutex>
-#include <time.h>
 
 static constexpr int VW = 1280, VH = 720;
 static thread_local GLCtx* t_cur = nullptr;
@@ -70,7 +67,8 @@ void gl_make_current(GLCtx* c) {
     t_cur = c;
     if (!c->initialized) {
         init_ctx(c);
-        SDL_GL_SetSwapInterval(0);  // vsync is emulated in gl_swap()
+        // ~60 Hz display: the host swap waits for the real vblank; otherwise vsync is emulated in gl_swap()
+        SDL_GL_SetSwapInterval(display::host_vsync_locked() ? 1 : 0);
     }
 }
 
@@ -100,8 +98,7 @@ static void wait_vsync(GLCtx* c) {
         if (cur >= next) break;
         u64 rem = next - cur;
         if (rem > 1500000ull) {
-            timespec ts{0, (long)(rem - 1000000ull)};
-            nanosleep(&ts, nullptr);
+            plat::sleep_ns(rem - 1000000ull);
         }
     }
     c->last_vsync = next;
@@ -191,6 +188,11 @@ void gl_swap() {
     int x0 = (dw - tw) / 2, y0 = (dh - th) / 2;
     bool integer = (tw % VW == 0) && (th % VH == 0);
     glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, c->vfb);
+    if (display::g_capture_req.exchange(false)) {
+        std::vector<u8> px(VW * VH * 4);
+        glReadPixels(0, 0, VW, VH, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px.data());
+        display::deliver_capture(px.data(), VW, VH);
+    }
     if (display::g_shot_req.exchange(false)) {
         std::vector<u8> px(VW * VH * 4);
         glReadPixels(0, 0, VW, VH, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px.data());
@@ -207,7 +209,18 @@ void gl_swap() {
     c->frames++;
     display::note_guest_gl_frame();
     count_fps();
-    if (c->swap_interval > 0) wait_vsync(c);  // eglSwapBuffers on Mali blocks until the next refresh
+    // eglSwapBuffers on Mali blocks until the next refresh
+    if (c->swap_interval > 0) {
+        if (display::host_vsync_locked()) {
+            // the host swap above already waited for vblank; only guard against swaps that stop
+            // blocking (minimised window): never faster than ~70 Hz
+            u64 n = now_ns();
+            if (c->last_vsync && n - c->last_vsync < 14000000ull) plat::sleep_ns(14000000ull - (n - c->last_vsync));
+            c->last_vsync = now_ns();
+        } else {
+            wait_vsync(c);
+        }
+    }
 }
 
 namespace display { std::string shot_name(); }

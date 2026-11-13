@@ -1,12 +1,6 @@
 // Guest filesystem namespace.
 #include "kernel.h"
-#include <dirent.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <poll.h>
 #include <algorithm>
-#include <cerrno>
 #include <map>
 
 int readlink_proc_p(Process& p, const std::string& guest_path, std::string& out);
@@ -82,34 +76,24 @@ std::string joinv(const std::vector<std::string>& v) {
 }
 }  // namespace
 
-void host_stat_to_linux(const struct stat& st, LinuxStat64& o) {
+void host_stat_to_linux(const hfs::Stat& st, LinuxStat64& o) {
     memset(&o, 0, sizeof o);
     o.st_dev = 0x801;
-    o.st_ino = st.st_ino;
-    o.st_ino_lo = (u32)st.st_ino;
-    u32 mode = st.st_mode & 07777;
-    switch (st.st_mode & S_IFMT) {
-    case S_IFREG: mode |= lnx::L_S_IFREG; break;
-    case S_IFDIR: mode |= lnx::L_S_IFDIR; break;
-    case S_IFLNK: mode |= lnx::L_S_IFLNK; break;
-    case S_IFIFO: mode |= lnx::L_S_IFIFO; break;
-    case S_IFSOCK: mode |= lnx::L_S_IFSOCK; break;
-    case S_IFCHR: mode |= lnx::L_S_IFCHR; break;
-    case S_IFBLK: mode |= lnx::L_S_IFBLK; break;
-    }
-    o.st_mode = mode;
-    o.st_nlink = st.st_nlink;
+    o.st_ino = st.ino;
+    o.st_ino_lo = (u32)st.ino;
+    o.st_mode = st.mode;
+    o.st_nlink = st.nlink;
     o.st_uid = 0;
     o.st_gid = 0;
-    o.st_size = st.st_size;
+    o.st_size = (s64)st.size;
     o.st_blksize = 4096;
-    o.st_blocks = st.st_blocks;
-    o.st_atime_ = (u32)st.st_atimespec.tv_sec;
-    o.st_atime_nsec = (u32)st.st_atimespec.tv_nsec;
-    o.st_mtime_ = (u32)st.st_mtimespec.tv_sec;
-    o.st_mtime_nsec = (u32)st.st_mtimespec.tv_nsec;
-    o.st_ctime_ = (u32)st.st_ctimespec.tv_sec;
-    o.st_ctime_nsec = (u32)st.st_ctimespec.tv_nsec;
+    o.st_blocks = st.blocks;
+    o.st_atime_ = (u32)(st.atime_ns / 1000000000ull);
+    o.st_atime_nsec = (u32)(st.atime_ns % 1000000000ull);
+    o.st_mtime_ = (u32)(st.mtime_ns / 1000000000ull);
+    o.st_mtime_nsec = (u32)(st.mtime_ns % 1000000000ull);
+    o.st_ctime_ = (u32)(st.ctime_ns / 1000000000ull);
+    o.st_ctime_nsec = (u32)(st.ctime_ns % 1000000000ull);
 }
 
 LinuxStat64 make_stat(u32 mode, u64 size, u64 rdev, u64 ino) {
@@ -131,61 +115,24 @@ LinuxStat64 make_stat(u32 mode, u64 size, u64 rdev, u64 ino) {
 
 // ---------------------------------------------------------------- HostFile
 HostFile::~HostFile() {
-    if (fd >= 0) ::close(fd);
-}
-
-static bool is_stream_fd(int fd) {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return false;
-    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || S_ISCHR(st.st_mode);
+    if (fd >= 0) hfs::close(fd);
 }
 
 s64 HostFile::read(Thread& t, u8* buf, u32 n) {
     if (is_dir) return -lnx::EISDIR_;
-    while (true) {
-        ssize_t r = ::read(fd, buf, n);
-        if (r >= 0) return r;
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN && !(flags & lnx::L_O_NONBLOCK)) {
-            int w = wait_fd(t, fd, POLLIN);
-            if (w == -lnx::EINTR_) return -ERESTARTSYS;
-            if (w < 0) return w;
-            continue;
-        }
-        return -host_errno_to_linux(errno);
-    }
+    return hfs::read(fd, buf, n);
 }
 s64 HostFile::write(Thread& t, const u8* buf, u32 n) {
-    u32 done = 0;
-    while (true) {
-        ssize_t r = ::write(fd, buf + done, n - done);
-        if (r >= 0) {
-            done += (u32)r;
-            if (done == n || (flags & lnx::L_O_NONBLOCK)) return done;
-            continue;
-        }
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN && !(flags & lnx::L_O_NONBLOCK)) {
-            int w = wait_fd(t, fd, POLLOUT);
-            if (w == -lnx::EINTR_) return done ? (s64)done : -ERESTARTSYS;
-            if (w < 0) return w;
-            continue;
-        }
-        if (errno == EPIPE) {
-            SigInfo si;
-            si.signo = lnx::L_SIGPIPE;
-            send_signal_thread(t, si);
-        }
-        return done ? (s64)done : -host_errno_to_linux(errno);
-    }
+    if (is_dir) return -lnx::EISDIR_;
+    return hfs::write(fd, buf, n, flags & lnx::L_O_APPEND);
 }
 s64 HostFile::pread(Thread&, u8* buf, u32 n, s64 off) {
-    ssize_t r = ::pread(fd, buf, n, off);
-    return r < 0 ? -host_errno_to_linux(errno) : r;
+    if (is_dir) return -lnx::EISDIR_;
+    return hfs::pread(fd, buf, n, off);
 }
 s64 HostFile::pwrite(Thread&, const u8* buf, u32 n, s64 off) {
-    ssize_t r = ::pwrite(fd, buf, n, off);
-    return r < 0 ? -host_errno_to_linux(errno) : r;
+    if (is_dir) return -lnx::EISDIR_;
+    return hfs::pwrite(fd, buf, n, off);
 }
 s64 HostFile::lseek(s64 off, int whence) {
     if (is_dir) {
@@ -200,16 +147,18 @@ s64 HostFile::lseek(s64 off, int whence) {
         }
         return -lnx::EINVAL_;
     }
-    off_t r = ::lseek(fd, off, whence);
-    return r < 0 ? -host_errno_to_linux(errno) : r;
+    return hfs::lseek(fd, off, whence);
 }
 int HostFile::ioctl(Thread& t, u32 req, u32 arg) {
     AddressSpace& m = *t.proc->mem;
     switch (req) {
     case 0x541B: {  // FIONREAD
-        int n = 0;
-        if (::ioctl(fd, FIONREAD, &n) < 0) return -host_errno_to_linux(errno);
-        m.wr<s32>(arg, n);
+        if (is_dir) return -lnx::EISDIR_;
+        hfs::Stat st;
+        int r = hfs::fstat(fd, st);
+        if (r < 0) return r;
+        s64 pos = hfs::lseek(fd, 0, 1);
+        m.wr<s32>(arg, pos >= 0 && (s64)st.size > pos ? (s32)(st.size - pos) : 0);
         return 0;
     }
     case 0x5421: {  // FIONBIO
@@ -217,46 +166,21 @@ int HostFile::ioctl(Thread& t, u32 req, u32 arg) {
         if (on) flags |= lnx::L_O_NONBLOCK; else flags &= ~lnx::L_O_NONBLOCK;
         return 0;
     }
-    case 0x5401:  // TCGETS
-        if (isatty(fd)) {
-            // Provide a plausible termios (raw-ish). struct termios: iflag oflag cflag lflag line cc[19]
-            u8 tio[36] = {};
-            u32 iflag = 0x500, oflag = 0x5, cflag = 0xbf, lflag = 0x8a3b;
-            memcpy(tio, &iflag, 4); memcpy(tio + 4, &oflag, 4); memcpy(tio + 8, &cflag, 4); memcpy(tio + 12, &lflag, 4);
-            m.write_bytes(arg, tio, sizeof tio);
-            return 0;
-        }
-        return -lnx::ENOTTY_;
-    case 0x5402: case 0x5403: case 0x5404:
-        return isatty(fd) ? 0 : -lnx::ENOTTY_;
-    case 0x5413:  // TIOCGWINSZ
-        if (isatty(fd)) {
-            u16 ws[4] = {25, 80, 0, 0};
-            m.write_bytes(arg, ws, 8);
-            return 0;
-        }
-        return -lnx::ENOTTY_;
     }
     return -lnx::ENOTTY_;
 }
 int HostFile::fstat(LinuxStat64& st) {
-    struct stat hs;
-    if (::fstat(fd, &hs) != 0) return -host_errno_to_linux(errno);
+    hfs::Stat hs;
+    int r = is_dir ? hfs::stat(host_path, hs) : hfs::fstat(fd, hs);
+    if (r < 0) return r;
     host_stat_to_linux(hs, st);
     return 0;
 }
 int HostFile::ftruncate(s64 len) {
-    return ::ftruncate(fd, len) == 0 ? 0 : -host_errno_to_linux(errno);
+    if (is_dir) return -lnx::EISDIR_;
+    return hfs::ftruncate(fd, len);
 }
 int HostFile::fsync() { return 0; }
-
-static u8 dtype_of(u8 hostd) {
-    switch (hostd) {
-    case DT_DIR: return 4; case DT_REG: return 8; case DT_LNK: return 10; case DT_FIFO: return 1;
-    case DT_SOCK: return 12; case DT_CHR: return 2; case DT_BLK: return 6;
-    }
-    return 0;
-}
 
 static int emit_dirents(AddressSpace& m, u8* buf, u32 n, const std::vector<std::pair<std::string, u8>>& list, size_t& pos) {
     u32 off = 0;
@@ -285,15 +209,14 @@ int HostFile::getdents64(Thread& t, u8* buf, u32 n) {
     if (!is_dir) return -lnx::ENOTDIR_;
     if (!dir_loaded) {
         dir_list.clear();
-        DIR* d = opendir(host_path.c_str());
-        if (!d) return -host_errno_to_linux(errno);
-        while (dirent* e = readdir(d)) dir_list.push_back({e->d_name, dtype_of(e->d_type)});
-        closedir(d);
+        int r = hfs::list_dir(host_path, dir_list);
+        if (r < 0) return r;
         for (auto& x : extra_entries)
             if (std::none_of(dir_list.begin(), dir_list.end(), [&](auto& y) { return y.first == x; })) {
-                struct stat est;
+                hfs::Stat est;
                 std::string h;
-                bool isdir = find_override(path + (path == "/" ? "" : "/") + x, h) && ::stat(h.c_str(), &est) == 0 && S_ISDIR(est.st_mode);
+                bool isdir = find_override(path + (path == "/" ? "" : "/") + x, h) && hfs::stat(h, est) == 0 &&
+                             (est.mode & lnx::L_S_IFMT) == lnx::L_S_IFDIR;
                 dir_list.push_back({x, (u8)(isdir ? 4 : 8)});
             }
         dir_loaded = true;
@@ -432,8 +355,8 @@ Resolved resolve(Process& p, const std::string& path, bool follow_last, int dirf
             is_link = virt_readlink(p, g, target);
         } else {
             std::string h = ov ? ovh : host_of(m, g);
-            struct stat st;
-            if (lstat(h.c_str(), &st) != 0) {
+            hfs::Stat st;
+            if (hfs::lstat(h, st) != 0) {
                 if (!last) {
                     r.err = lnx::ENOENT_;
                     // still return canonical for creation errors
@@ -441,15 +364,10 @@ Resolved resolve(Process& p, const std::string& path, bool follow_last, int dirf
                 }
                 break;
             }
-            if (S_ISLNK(st.st_mode)) {
-                char buf[4096];
-                ssize_t n = ::readlink(h.c_str(), buf, sizeof buf - 1);
-                if (n > 0) {
-                    buf[n] = 0;
-                    target = buf;
-                    is_link = true;
-                }
-            } else if (!last && !S_ISDIR(st.st_mode)) {
+            u32 type = st.mode & lnx::L_S_IFMT;
+            if (type == lnx::L_S_IFLNK) {
+                if (hfs::readlink(h, target) == 0 && !target.empty()) is_link = true;
+            } else if (!last && type != lnx::L_S_IFDIR) {
                 r.err = lnx::ENOTDIR_;
                 return r;
             }
@@ -484,17 +402,6 @@ Resolved resolve(Process& p, const std::string& path, bool follow_last, int dirf
     return r;
 }
 
-static int linux_to_host_oflags(u32 f) {
-    int h = f & 3;
-    if (f & lnx::L_O_CREAT) h |= O_CREAT;
-    if (f & lnx::L_O_EXCL) h |= O_EXCL;
-    if (f & lnx::L_O_TRUNC) h |= O_TRUNC;
-    if (f & lnx::L_O_APPEND) h |= O_APPEND;
-    if (f & lnx::L_O_NOFOLLOW) h |= O_NOFOLLOW;
-    if (f & lnx::L_O_NOCTTY) h |= O_NOCTTY;
-    return h;
-}
-
 FilePtr open(Thread& t, const std::string& path, u32 flags, u32 mode, int* err, int dirfd) {
     Process& p = *t.proc;
     bool follow = !(flags & lnx::L_O_NOFOLLOW) || true;
@@ -514,22 +421,24 @@ FilePtr open(Thread& t, const std::string& path, u32 flags, u32 mode, int* err, 
         return f;
     }
     u32 acc = flags & 3;
-    struct stat st;
-    bool exists = ::stat(r.host.c_str(), &st) == 0;
+    hfs::Stat st;
+    bool exists = hfs::stat(r.host, st) == 0;
+    u32 type = exists ? (st.mode & lnx::L_S_IFMT) : 0;
     if (!r.writable && (acc != 0 || (flags & lnx::L_O_TRUNC) || ((flags & lnx::L_O_CREAT) && !exists))) {
         *err = exists ? lnx::EROFS_ : lnx::EROFS_;
         if (!exists && !(flags & lnx::L_O_CREAT)) *err = lnx::ENOENT_;
         return nullptr;
     }
-    if (exists && S_ISDIR(st.st_mode)) {
+    if (exists && type == lnx::L_S_IFDIR) {
         if (acc != 0) {
             *err = lnx::EISDIR_;
             return nullptr;
         }
         auto f = std::make_shared<HostFile>();
-        f->fd = ::open(r.host.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        f->fd = hfs::open(r.host, lnx::L_O_DIRECTORY, 0);
         if (f->fd < 0) {
-            *err = host_errno_to_linux(errno);
+            *err = -f->fd;
+            f->fd = -1;
             return nullptr;
         }
         f->is_dir = true;
@@ -547,17 +456,21 @@ FilePtr open(Thread& t, const std::string& path, u32 flags, u32 mode, int* err, 
         *err = lnx::ENOTDIR_;
         return nullptr;
     }
-    if (exists && S_ISSOCK(st.st_mode)) {
+    if (exists && type == lnx::L_S_IFSOCK) {
         *err = lnx::ENXIO_;
         return nullptr;
     }
-    int hf = linux_to_host_oflags(flags) | O_CLOEXEC;
-    int fd = ::open(r.host.c_str(), hf | (exists && S_ISFIFO(st.st_mode) ? O_NONBLOCK : 0), (mode & ~p.umask) & 07777);
+    if (exists && type == lnx::L_S_IFIFO) {  // named pipe: an in-emulator pipe keyed by its host path
+        FilePtr f = ipc_open_fifo(t, r.host, flags, err);
+        if (f) f->path = r.guest;
+        return f;
+    }
+    u32 hflags = flags & (lnx::L_O_ACCMODE | lnx::L_O_CREAT | lnx::L_O_EXCL | lnx::L_O_TRUNC | lnx::L_O_NOFOLLOW | lnx::L_O_NOCTTY);
+    int fd = hfs::open(r.host, hflags, (mode & ~p.umask) & 07777);
     if (fd < 0) {
-        *err = host_errno_to_linux(errno);
+        *err = -fd;
         return nullptr;
     }
-    if (is_stream_fd(fd)) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     auto f = std::make_shared<HostFile>();
     f->fd = fd;
     f->host_path = r.host;
@@ -581,9 +494,9 @@ int stat(Thread& t, const std::string& path, LinuxStat64& st, bool follow, int d
         }
         return -lnx::ENOENT_;
     }
-    struct stat hs;
-    int rc = follow ? ::stat(r.host.c_str(), &hs) : ::lstat(r.host.c_str(), &hs);
-    if (rc != 0) return -host_errno_to_linux(errno);
+    hfs::Stat hs;
+    int rc = follow ? hfs::stat(r.host, hs) : hfs::lstat(r.host, hs);
+    if (rc != 0) return rc;
     host_stat_to_linux(hs, st);
     return 0;
 }
@@ -595,11 +508,7 @@ int readlink(Thread& t, const std::string& path, std::string& out, int dirfd) {
         if (virt_readlink(*t.proc, r.guest, out)) return 0;
         return -lnx::EINVAL_;
     }
-    char buf[4096];
-    ssize_t n = ::readlink(r.host.c_str(), buf, sizeof buf);
-    if (n < 0) return -host_errno_to_linux(errno);
-    out.assign(buf, n);
-    return 0;
+    return hfs::readlink(r.host, out);
 }
 
 bool read_file(Process& p, const std::string& path, std::vector<u8>& out, std::string* canonical) {
@@ -608,14 +517,21 @@ bool read_file(Process& p, const std::string& path, std::vector<u8>& out, std::s
         // virtual stub libraries are served from the HLE layer
         return false;
     }
-    FILE* f = fopen(r.host.c_str(), "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    out.resize(sz);
-    size_t got = fread(out.data(), 1, sz, f);
-    fclose(f);
+    int fd = hfs::open(r.host, 0, 0);
+    if (fd < 0) return false;
+    hfs::Stat st;
+    if (hfs::fstat(fd, st) != 0 || (st.mode & lnx::L_S_IFMT) == lnx::L_S_IFDIR) {
+        hfs::close(fd);
+        return false;
+    }
+    out.resize((size_t)st.size);
+    size_t got = 0;
+    while (got < out.size()) {
+        s64 n = hfs::pread(fd, out.data() + got, (u32)std::min<size_t>(out.size() - got, 1u << 24), (s64)got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    hfs::close(fd);
     out.resize(got);
     if (canonical) *canonical = r.guest;
     return true;

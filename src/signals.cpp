@@ -86,7 +86,7 @@ static bool pick_signal(Thread& t, int& signo, SigInfo& info) {
     u64 avail = (t.pending | t.proc->pending) & ~t.sigmask;
     // SIGKILL/SIGSTOP can't be blocked; handled elsewhere
     if (!avail) return false;
-    int s = __builtin_ctzll(avail) + 1;
+    int s = ctz64(avail) + 1;
     signo = s;
     info = SigInfo{};
     info.signo = s;

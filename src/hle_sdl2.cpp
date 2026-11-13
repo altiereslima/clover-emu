@@ -3,7 +3,6 @@
 #include "hle.h"
 #include "hle_gl.h"
 #include <SDL.h>
-#include <SDL_syswm.h>
 
 u32 guest_symbol(Process& p, const char* lib_substr, const char* sym);
 
@@ -111,18 +110,18 @@ HLE(LIB_SDL, SDL_SemValue) {
 }
 
 // ---------------------------------------------------------------- atomics
-HLE(LIB_SDL, SDL_AtomicAdd) { a.ret(__atomic_fetch_add((s32*)a.p(0), a.s(1), __ATOMIC_SEQ_CST)); }
-HLE(LIB_SDL, SDL_AtomicSet) { a.ret(__atomic_exchange_n((s32*)a.p(0), a.s(1), __ATOMIC_SEQ_CST)); }
-HLE(LIB_SDL, SDL_AtomicGet) { a.ret(__atomic_load_n((s32*)a.p(0), __ATOMIC_SEQ_CST)); }
+HLE(LIB_SDL, SDL_AtomicAdd) { a.ret(atomic_fetch_add_raw((s32*)a.p(0), a.s(1))); }
+HLE(LIB_SDL, SDL_AtomicSet) { a.ret(atomic_exchange_raw((s32*)a.p(0), a.s(1))); }
+HLE(LIB_SDL, SDL_AtomicGet) { a.ret(atomic_load_raw((s32*)a.p(0))); }
 HLE(LIB_SDL, SDL_AtomicCAS) {
     s32 expected = a.s(1);
-    a.ret(__atomic_compare_exchange_n((s32*)a.p(0), &expected, a.s(2), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0);
+    a.ret(atomic_cas_raw((s32*)a.p(0), &expected, a.s(2)) ? 1 : 0);
 }
-HLE(LIB_SDL, SDL_AtomicGetPtr) { a.ret(__atomic_load_n((u32*)a.p(0), __ATOMIC_SEQ_CST)); }
-HLE(LIB_SDL, SDL_AtomicSetPtr) { a.ret(__atomic_exchange_n((u32*)a.p(0), a.u(1), __ATOMIC_SEQ_CST)); }
+HLE(LIB_SDL, SDL_AtomicGetPtr) { a.ret(atomic_load_raw((u32*)a.p(0))); }
+HLE(LIB_SDL, SDL_AtomicSetPtr) { a.ret(atomic_exchange_raw((u32*)a.p(0), a.u(1))); }
 HLE(LIB_SDL, SDL_AtomicCASPtr) {
     u32 expected = a.u(1);
-    a.ret(__atomic_compare_exchange_n((u32*)a.p(0), &expected, a.u(2), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0);
+    a.ret(atomic_cas_raw((u32*)a.p(0), &expected, a.u(2)) ? 1 : 0);
 }
 
 // ---------------------------------------------------------------- misc

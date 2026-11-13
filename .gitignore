@@ -1,5 +1,11 @@
 # build output
 build/
+out/
+.vs/
+
+# Windows build dependencies fetched by scripts/setup-windows.ps1
+third_party/SDL2-win/
+third_party/boost/
 
 # Firmware images and extracted firmware (Nintendo copyrighted — never commit)
 *.hsqs

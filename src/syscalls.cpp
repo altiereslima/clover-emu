@@ -1,17 +1,7 @@
 // Linux ARM EABI syscall implementation (part 1: dispatcher, files, processes, signals, time).
 #include "kernel.h"
 #include "syscalls.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <poll.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-#include <sys/statvfs.h>
-#include <sys/file.h>
-#include <dirent.h>
 #include <algorithm>
-#include <cerrno>
 
 extern std::mutex g_sig_mtx;
 static inline u64 sigbit(int s) { return 1ull << (s - 1); }
@@ -77,6 +67,8 @@ static s32 do_stat(Thread& t, u32 pathp, u32 statp, bool follow, int dirfd = lnx
         if (!f) return -lnx::EBADF_;
         r = f->fstat(st);
     } else r = vfs::stat(t, path, st, follow, dirfd);
+    LOGC(LOG_VFS, "[vfs] pid %d stat(%s) -> %d size %lld mode %o\n", t.proc->pid, path.c_str(), r, r ? 0LL : (long long)st.st_size,
+         r ? 0u : (unsigned)st.st_mode);
     if (r) return r;
     m.write_bytes(statp, &st, sizeof st);
     return 0;
@@ -113,10 +105,10 @@ static s32 sys_faccessat(Thread& t, int dirfd, u32 pathp, int mode) {
         int e = vfs::stat(t, path, st, true, dirfd);
         return e;
     }
-    struct stat st;
-    if (::stat(r.host.c_str(), &st) != 0) return -host_errno_to_linux(errno);
+    hfs::Stat st;
+    if (int e = hfs::stat(r.host, st)) return e;
     if ((mode & 2) && !r.writable) return -lnx::EROFS_;
-    if ((mode & 1) && !(st.st_mode & 0111) && !S_ISDIR(st.st_mode)) return -lnx::EACCES_;
+    if ((mode & 1) && !(st.mode & 0111) && (st.mode & lnx::L_S_IFMT) != lnx::L_S_IFDIR) return -lnx::EACCES_;
     return 0;
 }
 
@@ -174,11 +166,7 @@ static s32 sys_fcntl(Thread& t, int fd, int cmd, u32 arg) {
     case 3: return f->flags | lnx::L_O_LARGEFILE;  // F_GETFL
     case 4:  // F_SETFL
         f->flags = (f->flags & ~(lnx::L_O_NONBLOCK | lnx::L_O_APPEND)) | (arg & (lnx::L_O_NONBLOCK | lnx::L_O_APPEND));
-        if (f->host_fd() >= 0) {
-            int hf = fcntl(f->host_fd(), F_GETFL);
-            if (arg & lnx::L_O_APPEND) hf |= O_APPEND; else hf &= ~O_APPEND;
-            fcntl(f->host_fd(), F_SETFL, hf);
-        }
+        io_notify();
         return 0;
     case 5: case 12: {  // F_GETLK / F_GETLK64: report unlocked
         // struct flock64: short l_type ...
@@ -194,22 +182,16 @@ static s32 sys_fcntl(Thread& t, int fd, int cmd, u32 arg) {
 }
 
 static s32 sys_pipe2(Thread& t, u32 fdsp, u32 flags) {
-    int p[2];
-    if (::pipe(p) != 0) return -host_errno_to_linux(errno);
-    for (int i = 0; i < 2; i++) {
-        fcntl(p[i], F_SETFL, O_NONBLOCK);
-        fcntl(p[i], F_SETFD, FD_CLOEXEC);
-    }
-    auto r = std::make_shared<HostFile>();
-    r->fd = p[0];
-    r->flags = 0 | (flags & lnx::L_O_NONBLOCK);
-    r->path = "pipe:[" + std::to_string(p[0]) + "]";
-    auto w = std::make_shared<HostFile>();
-    w->fd = p[1];
-    w->flags = 1 | (flags & lnx::L_O_NONBLOCK);
-    w->path = r->path;
+    FilePtr r, w;
+    ipc_make_pipe(r, w, flags & lnx::L_O_NONBLOCK);
     bool ce = flags & lnx::L_O_CLOEXEC;
-    int a = fd_install(t, r, ce), b = fd_install(t, w, ce);
+    int a = fd_install(t, r, ce);
+    if (a < 0) return a;
+    int b = fd_install(t, w, ce);
+    if (b < 0) {
+        t.proc->fds->close(a);
+        return b;
+    }
     t.proc->mem->wr<s32>(fdsp, a);
     t.proc->mem->wr<s32>(fdsp + 4, b);
     return 0;
@@ -292,9 +274,9 @@ static s32 sys_chdir(Thread& t, const std::string& path) {
     Resolved r = vfs::resolve(*t.proc, path, true);
     if (r.err) return -r.err;
     if (r.kind == Resolved::HOST) {
-        struct stat st;
-        if (::stat(r.host.c_str(), &st) != 0) return -host_errno_to_linux(errno);
-        if (!S_ISDIR(st.st_mode)) return -lnx::ENOTDIR_;
+        hfs::Stat st;
+        if (int e = hfs::stat(r.host, st)) return e;
+        if ((st.mode & lnx::L_S_IFMT) != lnx::L_S_IFDIR) return -lnx::ENOTDIR_;
     }
     t.proc->cwd = r.guest;
     return 0;
@@ -592,7 +574,7 @@ static s32 sys_rt_sigtimedwait(Thread& t, u32 setp, u32 infop, u32 tsp) {
             std::lock_guard lk(g_sig_mtx);
             u64 avail = (t.pending | t.proc->pending) & set;
             if (avail) {
-                int s = __builtin_ctzll(avail) + 1;
+                int s = ctz64(avail) + 1;
                 SigInfo info;
                 info.signo = s;
                 auto take = [&](u64& pend, std::deque<SigInfo>& q) {
@@ -654,9 +636,9 @@ static s32 sys_clock_nanosleep(Thread& t, int clk, int flags, u32 reqp, u32 remp
 // itimer support: a background thread fires SIGALRM
 static std::once_flag g_timer_once;
 static void timer_thread() {
-    pthread_setname_np("itimer");
+    plat::set_thread_name("itimer");
     while (true) {
-        usleep(2000);
+        plat::usleep_us(2000);
         std::vector<std::shared_ptr<Process>> fire;
         u64 n = now_ns();
         {
@@ -821,11 +803,11 @@ void do_syscall(Thread& t) {
         ret = f ? sys_chdir(t, f->path) : -lnx::EBADF_;
         break;
     }
-    case 10: { std::string h; ret = resolve_mod(t, lnx::L_AT_FDCWD, a0, h); if (!ret) ret = ::unlink(h.c_str()) ? -host_errno_to_linux(errno) : 0; break; }
+    case 10: { std::string h; ret = resolve_mod(t, lnx::L_AT_FDCWD, a0, h); if (!ret) ret = hfs::unlink(h); break; }
     case 328: {  // unlinkat
         std::string h;
         ret = resolve_mod(t, (s32)a0, a1, h);
-        if (!ret) ret = ((a2 & lnx::L_AT_REMOVEDIR) ? ::rmdir(h.c_str()) : ::unlink(h.c_str())) ? -host_errno_to_linux(errno) : 0;
+        if (!ret) ret = (a2 & lnx::L_AT_REMOVEDIR) ? hfs::rmdir(h) : hfs::unlink(h);
         break;
     }
     case 14: case 324: {  // mknod / mknodat
@@ -834,10 +816,10 @@ void do_syscall(Thread& t) {
         std::string h;
         ret = resolve_mod(t, dfd, pathp, h);
         if (!ret) {
-            if ((mode & lnx::L_S_IFMT) == lnx::L_S_IFIFO) ret = mkfifo(h.c_str(), mode & 0777) ? -host_errno_to_linux(errno) : 0;
+            if ((mode & lnx::L_S_IFMT) == lnx::L_S_IFIFO) ret = hfs::mkfifo(h, mode & 0777);
             else if ((mode & lnx::L_S_IFMT) == lnx::L_S_IFREG || (mode & lnx::L_S_IFMT) == 0) {
-                int fd = ::open(h.c_str(), O_CREAT | O_EXCL | O_WRONLY, mode & 0777);
-                ret = fd < 0 ? -host_errno_to_linux(errno) : (::close(fd), 0);
+                int fd = hfs::open(h, lnx::L_O_CREAT | lnx::L_O_EXCL | 1u, mode & 0777);
+                ret = fd < 0 ? fd : (hfs::close(fd), 0);
             } else ret = 0;  // device nodes: pretend
         }
         break;
@@ -880,7 +862,7 @@ void do_syscall(Thread& t) {
         std::string ho, hn;
         ret = resolve_mod(t, od, op, ho);
         if (!ret) ret = resolve_mod(t, nd, np, hn);
-        if (!ret) ret = ::rename(ho.c_str(), hn.c_str()) ? -host_errno_to_linux(errno) : 0;
+        if (!ret) ret = hfs::rename(ho, hn);
         break;
     }
     case 39: case 323: {  // mkdir / mkdirat
@@ -891,13 +873,11 @@ void do_syscall(Thread& t) {
         Resolved r = vfs::resolve(p, path, false, d);
         if (r.err) ret = -r.err;
         else if (r.kind != Resolved::HOST) ret = -lnx::EEXIST_;
-        else if (!r.writable) {
-            struct stat st;
-            ret = ::stat(r.host.c_str(), &st) == 0 ? -lnx::EEXIST_ : -lnx::EROFS_;
-        } else ret = ::mkdir(r.host.c_str(), mode & 0777) ? -host_errno_to_linux(errno) : 0;
+        else if (!r.writable) ret = hfs::exists(r.host) ? -lnx::EEXIST_ : -lnx::EROFS_;
+        else ret = hfs::mkdir(r.host, mode & 0777);
         break;
     }
-    case 40: { std::string h; ret = resolve_mod(t, lnx::L_AT_FDCWD, a0, h); if (!ret) ret = ::rmdir(h.c_str()) ? -host_errno_to_linux(errno) : 0; break; }
+    case 40: { std::string h; ret = resolve_mod(t, lnx::L_AT_FDCWD, a0, h); if (!ret) ret = hfs::rmdir(h); break; }
     case 41: { FilePtr f = p.fds->get(a0); ret = f ? p.fds->install(f, false) : -lnx::EBADF_; break; }
     case 63: { FilePtr f = p.fds->get(a0); ret = !f ? -lnx::EBADF_ : (a0 == a1 ? (s32)a1 : p.fds->install_at(a1, f, false)); break; }
     case 358: ret = sys_dup3(t, a0, a1, a2); break;
@@ -998,14 +978,14 @@ void do_syscall(Thread& t) {
         std::string target = m.read_str(a0);
         std::string h;
         ret = resolve_mod(t, nr == 83 ? lnx::L_AT_FDCWD : (s32)a1, nr == 83 ? a1 : a2, h);
-        if (!ret) ret = ::symlink(target.c_str(), h.c_str()) ? -host_errno_to_linux(errno) : 0;
+        if (!ret) ret = hfs::symlink(target, h);
         break;
     }
     case 9: case 330: {  // link / linkat
         std::string ho, hn;
         ret = resolve_mod(t, nr == 9 ? lnx::L_AT_FDCWD : (s32)a0, nr == 9 ? a0 : a1, ho, true);
         if (!ret) ret = resolve_mod(t, nr == 9 ? lnx::L_AT_FDCWD : (s32)a2, nr == 9 ? a1 : a3, hn);
-        if (!ret) ret = ::link(ho.c_str(), hn.c_str()) ? -host_errno_to_linux(errno) : 0;
+        if (!ret) ret = hfs::link(ho, hn);
         break;
     }
     case 85: case 332: {  // readlink / readlinkat
@@ -1027,7 +1007,7 @@ void do_syscall(Thread& t) {
         std::string h;
         ret = resolve_mod(t, lnx::L_AT_FDCWD, a0, h, true);
         s64 len = nr == 92 ? (s64)(s32)a1 : (s64)(((u64)a3 << 32) | a2);
-        if (!ret) ret = ::truncate(h.c_str(), len) ? -host_errno_to_linux(errno) : 0;
+        if (!ret) ret = hfs::truncate(h, len);
         break;
     }
     case 93: case 194: {  // ftruncate / ftruncate64

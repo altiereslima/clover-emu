@@ -89,10 +89,10 @@ public:
     void MemoryWrite16(u32 a, std::uint16_t v) override { memcpy(mem + a, &v, 2); }
     void MemoryWrite32(u32 a, std::uint32_t v) override { memcpy(mem + a, &v, 4); }
     void MemoryWrite64(u32 a, std::uint64_t v) override { memcpy(mem + a, &v, 8); }
-    bool MemoryWriteExclusive8(u32 a, std::uint8_t v, std::uint8_t e) override { return __atomic_compare_exchange_n((u8*)(mem + a), &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
-    bool MemoryWriteExclusive16(u32 a, std::uint16_t v, std::uint16_t e) override { return __atomic_compare_exchange_n((u16*)(mem + a), &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
-    bool MemoryWriteExclusive32(u32 a, std::uint32_t v, std::uint32_t e) override { return __atomic_compare_exchange_n((u32*)(mem + a), &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
-    bool MemoryWriteExclusive64(u32 a, std::uint64_t v, std::uint64_t e) override { return __atomic_compare_exchange_n((u64*)(mem + a), &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    bool MemoryWriteExclusive8(u32 a, std::uint8_t v, std::uint8_t e) override { return atomic_cas_raw((u8*)(mem + a), &e, v); }
+    bool MemoryWriteExclusive16(u32 a, std::uint16_t v, std::uint16_t e) override { return atomic_cas_raw((u16*)(mem + a), &e, v); }
+    bool MemoryWriteExclusive32(u32 a, std::uint32_t v, std::uint32_t e) override { return atomic_cas_raw((u32*)(mem + a), &e, v); }
+    bool MemoryWriteExclusive64(u32 a, std::uint64_t v, std::uint64_t e) override { return atomic_cas_raw((u64*)(mem + a), &e, v); }
     void InterpreterFallback(u32 pc, size_t num) override;
     void CallSVC(std::uint32_t swi) override;
     void ExceptionRaised(u32 pc, Dynarmic::A32::Exception e) override;
@@ -127,7 +127,6 @@ struct Thread {
     // interruptible wait support
     std::mutex wmtx;
     std::condition_variable wcv;
-    int wake_pipe[2] = {-1, -1};
     std::atomic<bool> interrupted{false};
 
     // pending actions set inside syscalls, handled after Run() returns
@@ -210,6 +209,22 @@ struct Kernel {
     int alloc_pid() { return next_pid++; }
     std::shared_ptr<Process> find_proc(int pid);
     Thread* find_thread(int tid);
+
+    // Host pause (in-game menu): guest threads block at their next syscall / HLE call.
+    std::atomic<bool> paused{false};
+    std::mutex pause_mtx;
+    std::condition_variable pause_cv;
+    void pause_gate() {
+        std::unique_lock lk(pause_mtx);
+        pause_cv.wait(lk, [&] { return !paused.load() || shutting_down.load(); });
+    }
+    void set_paused(bool p) {
+        {
+            std::lock_guard lk(pause_mtx);
+            paused = p;
+        }
+        pause_cv.notify_all();
+    }
 };
 extern Kernel g_kernel;
 
@@ -237,9 +252,12 @@ void write_kuser_page(AddressSpace& as);
 Thread* create_thread(std::shared_ptr<Process> p, const std::array<u32, 16>& regs, u32 cpsr,
                       const std::array<u32, 64>& ext, u32 fpscr, u32 tls);
 void start_thread(Thread* t);
-// interruptible waits
-// Wait on a host fd for events (POLLIN/POLLOUT). Returns 0 when ready, -EINTR if signalled, -ETIMEDOUT on timeout.
-int wait_fd(Thread& t, int fd, short events, s64 timeout_ms = -1);
+// in-emulator IPC (ipc.cpp): pipes, FIFOs, sockets, eventfd, poll/select/epoll
+// io_notify(): readiness of some pipe/socket/eventfd changed, or a thread was kicked -- wakes waiters.
+void io_notify();
+void ipc_make_pipe(FilePtr& rd, FilePtr& wr, bool nonblock);
+FilePtr ipc_open_fifo(Thread& t, const std::string& key, u32 flags, int* err);
+s32 ipc_syscall(Thread& t, u32 nr);  // poll/select/epoll/eventfd/inotify/socket family; -ENOSYS if not handled
 // sleep interruptibly; returns 0 or -EINTR
 int sleep_ns(Thread& t, u64 ns, u64* remaining = nullptr);
 

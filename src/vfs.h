@@ -1,10 +1,10 @@
 // Virtual filesystem: guest path resolution onto the extracted rootfs + overlays + virtual devices.
 #pragma once
 #include "common.h"
+#include "hostfs.h"
 #include <memory>
 #include <mutex>
 #include <functional>
-#include <sys/stat.h>
 
 struct Thread;
 struct Process;
@@ -32,7 +32,7 @@ struct LinuxStat64 {
 };
 static_assert(sizeof(LinuxStat64) == 104, "stat64 layout");
 
-void host_stat_to_linux(const struct stat& st, LinuxStat64& out);
+void host_stat_to_linux(const hfs::Stat& st, LinuxStat64& out);
 LinuxStat64 make_stat(u32 mode, u64 size = 0, u64 rdev = 0, u64 ino = 1);
 
 // Open file description.
@@ -48,12 +48,14 @@ struct File : std::enable_shared_from_this<File> {
     virtual int ioctl(Thread&, u32 req, u32 arg) { return -lnx::ENOTTY_; }
     virtual int fstat(LinuxStat64& st) = 0;
     virtual int getdents64(Thread&, u8* buf, u32 n) { return -lnx::ENOTDIR_; }
-    virtual int host_fd() { return -1; }    // if backed by a host fd, used for poll/select
-    // For virtual files without host fd: return ready mask for POLLIN(1)/POLLOUT(4)
+    // Readiness for poll/select/epoll: mask of POLLIN(1) / POLLOUT(4) / POLLERR(8) / POLLHUP(0x10).
+    // Files whose readiness can change (pipes, sockets, eventfd) call io_notify() when it does.
     virtual u32 poll_mask() { return 1 | 4; }
     // mmap hook. Return -errno, or 0 and fill *done=true if handled (shared mapping); otherwise
     // default implementation copies contents via pread.
     virtual int mmap(Thread&, u32 addr, u32 len, u32 prot, u32 flags, u64 off, bool* handled) { *handled = false; return 0; }
+    // Non-zero: the mapping must live at this guest address (shared device memory on Windows).
+    virtual u32 mmap_fixed(u64 off) { return 0; }
     virtual int ftruncate(s64 len) { return -lnx::EINVAL_; }
     virtual int fsync() { return 0; }
     virtual bool is_socket() const { return false; }
@@ -62,13 +64,12 @@ struct File : std::enable_shared_from_this<File> {
 };
 using FilePtr = std::shared_ptr<File>;
 
-// File backed by a host fd (regular file, directory, pipe, socket)
+// File backed by a host file or directory (hostfs fd)
 struct HostFile : File {
     int fd = -1;
     bool is_dir = false;
     std::string host_path;
     // directory iteration state
-    void* dirp = nullptr;
     std::vector<std::string> extra_entries; // merged entries (e.g. virtual mounts)
     size_t dir_pos = 0;
     std::vector<std::pair<std::string, u8>> dir_list; bool dir_loaded = false;
@@ -81,7 +82,6 @@ struct HostFile : File {
     int ioctl(Thread&, u32 req, u32 arg) override;
     int fstat(LinuxStat64& st) override;
     int getdents64(Thread&, u8* buf, u32 n) override;
-    int host_fd() override { return fd; }
     int ftruncate(s64 len) override;
     int fsync() override;
 };

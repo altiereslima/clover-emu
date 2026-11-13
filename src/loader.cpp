@@ -2,7 +2,6 @@
 #include "kernel.h"
 #include <cstring>
 #include <algorithm>
-#include <unistd.h>
 
 namespace {
 struct Elf32_Ehdr {
@@ -129,10 +128,10 @@ static int prepare_exec(Process& p, std::string path, std::vector<std::string> a
         Resolved r = vfs::resolve(p, path, true);
         if (r.err) return -r.err;
         if (r.kind != Resolved::HOST) return -lnx::EACCES_;
-        struct stat st;
-        if (::stat(r.host.c_str(), &st) != 0) return -lnx::ENOENT_;
-        if (S_ISDIR(st.st_mode)) return -lnx::EACCES_;
-        if (!(st.st_mode & 0111)) return -lnx::EACCES_;
+        hfs::Stat st;
+        if (hfs::stat(r.host, st) != 0) return -lnx::ENOENT_;
+        if ((st.mode & lnx::L_S_IFMT) == lnx::L_S_IFDIR) return -lnx::EACCES_;
+        if (!(st.mode & 0111)) return -lnx::EACCES_;
         if (!vfs::read_file(p, path, data, &canon)) return -lnx::ENOENT_;
         if (data.size() >= 2 && data[0] == '#' && data[1] == '!') {
             std::string line;
@@ -206,7 +205,7 @@ static int load_image(Thread& t, ExecRequest& req) {
     sp &= ~15u;
     sp -= 16;
     u32 random = sp;
-    for (int i = 0; i < 16; i++) as.wr<u8>(random + i, (u8)arc4random());
+    plat::random_bytes(as.ptr(random), 16);
     std::vector<std::pair<u32, u32>> auxv = {
         {3, exe.phdr}, {4, 32}, {5, exe.phnum}, {6, GUEST_PAGE}, {7, interp.base}, {8, 0}, {9, exe.entry},
         {11, 0}, {12, 0}, {13, 0}, {14, 0}, {15, platform},
@@ -286,7 +285,7 @@ int finish_exec(Thread& t) {
                 alone = std::all_of(p.threads.begin(), p.threads.end(), [&](Thread* x) { return x == &t || x->is_host_call; });
             }
             if (alone) break;
-            usleep(1000);
+            plat::usleep_us(1000);
         }
     }
     hle_process_exec(p);

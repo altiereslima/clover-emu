@@ -2,7 +2,6 @@
 #include "hle.h"
 #include "syscalls.h"
 #include <algorithm>
-#include <sys/stat.h>
 
 namespace {
 struct Entry {
@@ -159,7 +158,7 @@ void hle_init(const std::string& rundir) {
     ensure_sorted();
     auto& tb = table();
     std::string dir = rundir + "/hle";
-    mkdir(dir.c_str(), 0755);
+    hfs::mkdir(dir, 0755);
     struct LibOut {
         HleLib lib;
         const char* guest;
@@ -176,11 +175,7 @@ void hle_init(const std::string& rundir) {
             if (tb[i].lib == L.lib) syms.push_back({tb[i].name, i});
         auto so = build_so(syms, L.soname);
         std::string host = dir + "/" + L.soname;
-        FILE* f = fopen(host.c_str(), "wb");
-        if (!f) fatal("cannot write %s", host.c_str());
-        fwrite(so.data(), 1, so.size(), f);
-        fclose(f);
-        chmod(host.c_str(), 0755);
+        if (!hfs::write_file(host, so.data(), so.size(), 0755)) fatal("cannot write %s", host.c_str());
         vfs::add_override(L.guest, host);
         LOGC(LOG_HLE, "[hle] %s: %zu stub functions\n", L.guest, syms.size());
     }

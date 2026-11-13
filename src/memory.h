@@ -12,12 +12,16 @@ constexpr u32 STACK_TOP = 0xbf000000;
 constexpr u32 STACK_SIZE = 8u << 20;
 constexpr u32 MMAP_TOP = 0xb7000000;
 constexpr u32 KUSER_PAGE = 0xffff0000;
+// Guest window reserved for host-shared mappings (/dev/fb0). Unused by the guest otherwise: it lies
+// between MMAP_TOP and the stack. Windows needs shared views at a pre-reserved placeholder.
+constexpr u32 SHARED_WIN = 0xb8000000;
+constexpr u32 SHARED_WIN_SIZE = 0x01000000;
 
 struct Region {
     u64 end;
     u32 prot;
     bool shared = false;     // host-shared mapping (e.g. framebuffer)
-    int shm_fd = -1;         // host fd for shared mapping
+    intptr_t shm = -1;       // shared memory object (fd on POSIX, section HANDLE on Windows)
     u64 shm_off = 0;
     std::string name;
 };
@@ -36,8 +40,9 @@ public:
     u32 find_free(u32 len, u32 align = GUEST_PAGE);
     bool is_free(u32 addr, u32 len);
     void map(u32 addr, u32 len, u32 prot, const std::string& name, bool zero = true);
-    // Map host-shared memory (fd) at addr. addr/len must be 16K aligned (host page).
-    bool map_shared(u32 addr, u32 len, int fd, u64 off, const std::string& name);
+    // Map host-shared memory at addr. addr/off must be host-page aligned; on Windows the mapping must
+    // lie in [SHARED_WIN, SHARED_WIN + SHARED_WIN_SIZE) and addr/off be 64 KiB aligned.
+    bool map_shared(u32 addr, u32 len, intptr_t shm, u64 off, const std::string& name);
     void unmap(u32 addr, u32 len);
     void protect(u32 addr, u32 len, u32 prot);
     void zero(u32 addr, u32 len);
@@ -63,7 +68,12 @@ public:
 private:
     void split_at(u32 addr);
     void erase_range(u32 addr, u32 end);
+    bool host_map_shared(u32 addr, u64 len, intptr_t shm, u64 off);
+    void host_unmap_shared(u32 addr, u64 len);
     u8* base_ = nullptr;
+#ifdef _WIN32
+    u32 view_addr_ = 0;  // current shared view in the window (Windows: one at a time)
+#endif
 };
 
 u32 host_page_size();

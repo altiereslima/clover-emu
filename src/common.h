@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstring>
+#include "platform.h"
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -28,10 +30,14 @@ enum LogCat : u32 {
     LOG_DEV = 1u << 7,
 };
 extern u32 g_log_mask;
-void log_raw(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void log_raw(const char* fmt, ...) CLOVER_PRINTF(1, 2);
 #define LOGC(cat, ...) do { if (g_log_mask & (cat)) log_raw(__VA_ARGS__); } while (0)
 #define LOGI(...) log_raw(__VA_ARGS__)
-[[noreturn]] void fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+[[noreturn]] void fatal(const char* fmt, ...) CLOVER_PRINTF(1, 2);
+extern void (*g_fatal_hook)(const char* msg);  // e.g. show an error dialog before exiting
+// Immediate process exit without library teardown (guest threads may still be blocked; on Windows
+// ExitProcess would run DLL detach code, e.g. of the GL driver, that can hang on them).
+[[noreturn]] void hard_exit(int code);
 
 // ---------------------------------------------------------------- Linux ABI constants (ARM EABI)
 namespace lnx {

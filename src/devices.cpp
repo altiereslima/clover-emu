@@ -1,9 +1,6 @@
 // /dev and /proc virtual files.
 #include "kernel.h"
 #include "display.h"
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
 #include <algorithm>
 
 namespace {
@@ -12,7 +9,7 @@ struct NullDev : File {
     explicit NullDev(int k) : kind(k) {}
     s64 read(Thread&, u8* buf, u32 n) override {
         if (kind == 0) return 0;
-        if (kind == 3) arc4random_buf(buf, n);
+        if (kind == 3) plat::random_bytes(buf, n);
         else memset(buf, 0, n);
         return n;
     }
@@ -157,9 +154,12 @@ struct FbDev : File {
         st = make_stat(lnx::L_S_IFCHR | 0660, 0, 0x1d00);
         return 0;
     }
+#ifdef _WIN32
+    u32 mmap_fixed(u64 off) override { return SHARED_WIN + (u32)off; }
+#endif
     int mmap(Thread& t, u32 addr, u32 len, u32 prot, u32 flags, u64 off, bool* handled) override {
         auto& fb = display::fb();
-        if (!t.proc->mem->map_shared(addr, std::min<u32>(len, fb.size), fb.shm_fd, off, "/dev/fb0")) {
+        if (!t.proc->mem->map_shared(addr, std::min<u32>(len, fb.size), fb.shm, off, "/dev/fb0")) {
             LOGI("[fb0] map_shared failed at %08x\n", addr);
             return -lnx::ENOMEM_;
         }

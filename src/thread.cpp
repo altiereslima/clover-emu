@@ -1,25 +1,11 @@
 // Threads, CPU glue (dynarmic callbacks), fd tables, interruptible waits.
 #include "kernel.h"
-#include <poll.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <pthread/qos.h>
-#include <time.h>
 #include <algorithm>
 
 Kernel g_kernel;
 
-u64 now_ns() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-}
-u64 realtime_ns() {
-    timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-}
+u64 now_ns() { return plat::now_ns(); }
+u64 realtime_ns() { return plat::realtime_ns(); }
 
 std::shared_ptr<Process> Kernel::find_proc(int pid) {
     auto it = procs.find(pid);
@@ -139,7 +125,7 @@ void Process::suspend_others(Thread* self) {
         for (int i = 0; i < 2000; i++) {
             auto s = t->state.load();
             if (s != ThreadState::Running) break;
-            usleep(500);
+            plat::usleep_us(500);
         }
     }
 }
@@ -220,6 +206,7 @@ void CpuCallbacks::ExceptionRaised(u32 pc, Dynarmic::A32::Exception e) {
 
 void CpuCallbacks::CallSVC(std::uint32_t swi) {
     Thread& t = *t_;
+    if (g_kernel.paused.load(std::memory_order_relaxed)) g_kernel.pause_gate();
     if (swi == 0) {
         t.state = ThreadState::InSyscall;
         do_syscall(t);
@@ -271,10 +258,7 @@ void Thread::kick() {
         interrupted = true;
         wcv.notify_all();
     }
-    if (wake_pipe[1] >= 0) {
-        char c = 1;
-        (void)::write(wake_pipe[1], &c, 1);
-    }
+    io_notify();  // wakes poll/pipe/socket waits
     if (jit) jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
 }
 
@@ -289,12 +273,6 @@ Thread* create_thread(std::shared_ptr<Process> p, const std::array<u32, 16>& reg
     t->proc_ref = p;
     t->tls = tls;
     t->cpu_slot = p->alloc_cpu_slot();
-    if (pipe(t->wake_pipe) == 0) {
-        fcntl(t->wake_pipe[0], F_SETFL, O_NONBLOCK);
-        fcntl(t->wake_pipe[1], F_SETFL, O_NONBLOCK);
-        fcntl(t->wake_pipe[0], F_SETFD, FD_CLOEXEC);
-        fcntl(t->wake_pipe[1], F_SETFD, FD_CLOEXEC);
-    }
     t->create_jit();
     t->jit->Regs() = regs;
     t->jit->SetCpsr(cpsr);
@@ -317,9 +295,9 @@ static void finalize_thread(Thread* t);
 void Thread::run_loop() {
     char name[64];
     snprintf(name, sizeof name, "guest %d/%d", proc->pid, tid);
-    pthread_setname_np(name);
-    // Highest QoS: minimal timer leeway and P-core scheduling (the guest is a real-time console).
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    plat::set_thread_name(name);
+    // the guest is a real-time console: minimal timer leeway / high scheduling priority
+    plat::set_thread_realtime();
     while (!exit_req) {
         if (proc->suspend_req) {
             state = ThreadState::Suspended;
@@ -364,8 +342,6 @@ static void finalize_thread(Thread* t) {
         std::lock_guard lk(g_kernel.mtx);
         g_kernel.threads.erase(t->tid);
     }
-    if (t->wake_pipe[0] >= 0) ::close(t->wake_pipe[0]);
-    if (t->wake_pipe[1] >= 0) ::close(t->wake_pipe[1]);
     t->jit.reset();
     delete t;
     if (last) {
@@ -381,38 +357,10 @@ bool Thread::signal_pending() {
     return (pend & ~sigmask) != 0 || exit_req;
 }
 
-int wait_fd(Thread& t, int fd, short events, s64 timeout_ms) {
-    // drain wake pipe
-    char buf[64];
-    while (::read(t.wake_pipe[0], buf, sizeof buf) > 0) {}
-    if (t.signal_pending()) return -lnx::EINTR_;
-    pollfd pf[2] = {{fd, events, 0}, {t.wake_pipe[0], POLLIN, 0}};
-    u64 deadline = timeout_ms >= 0 ? now_ns() + (u64)timeout_ms * 1000000ull : 0;
-    while (true) {
-        int to = -1;
-        if (timeout_ms >= 0) {
-            u64 n = now_ns();
-            if (n >= deadline) return -lnx::ETIMEDOUT_;
-            to = (int)((deadline - n) / 1000000ull) + 1;
-        }
-        int r = ::poll(pf, 2, to);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -host_errno_to_linux(errno);
-        }
-        if (pf[0].revents) return 0;
-        if (pf[1].revents) {
-            while (::read(t.wake_pipe[0], buf, sizeof buf) > 0) {}
-            if (t.signal_pending()) return -lnx::EINTR_;
-        }
-        if (r == 0 && timeout_ms >= 0) return -lnx::ETIMEDOUT_;
-    }
-}
-
 int sleep_ns(Thread& t, u64 ns, u64* remaining) {
-    // Interruptible coarse wait on the thread's condition variable, then a precise nanosleep for the
-    // last ~2 ms: macOS timer leeway would otherwise add 2-4 ms to every sleep, which wrecks guest
-    // frame pacing (the firmware paces its frames with nanosleep).
+    // Interruptible coarse wait on the thread's condition variable, then a precise sleep for the
+    // last ~2 ms: host timer slack (macOS leeway, Windows' scheduler tick) would otherwise add
+    // milliseconds to every sleep, which wrecks guest frame pacing (the firmware paces with nanosleep).
     u64 deadline = now_ns() + ns;
     while (true) {
         if (t.signal_pending()) {
@@ -429,8 +377,7 @@ int sleep_ns(Thread& t, u64 ns, u64* remaining) {
             t.wcv.wait_for(lk, std::chrono::nanoseconds(std::min<u64>(rem - 2000000ull, 50000000ull)),
                            [&] { return t.interrupted.load(); });
         } else {
-            timespec ts{0, (long)rem};
-            nanosleep(&ts, nullptr);
+            plat::sleep_ns(rem);
         }
     }
 }

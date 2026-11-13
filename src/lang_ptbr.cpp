@@ -390,7 +390,9 @@ bool console_lang_is_pt(const std::string& datadir) {
     return s.find("pt") != std::string::npos;
 }
 
-void apply_splash(const fs::path& root, const fs::path& outroot) {
+// The translated splash is used whenever the console's saved language is Portuguese at the moment
+// the firmware opens it, so choosing Português during a session already applies to its shutdown.
+void apply_splash(const fs::path& root, const fs::path& outroot, const std::string& datadir) {
     for (const char* rel : {"usr/share/clover-mcp/splash/shutdown.lz4", "usr/share/clover-mcp/splash/shutdown.lzo"}) {
         fs::path src = root / rel;
         std::ifstream in(src, std::ios::binary);
@@ -410,8 +412,8 @@ void apply_splash(const fs::path& root, const fs::path& outroot) {
         std::error_code ec;
         fs::create_directories(dst.parent_path(), ec);
         std::ofstream(dst, std::ios::binary).write((const char*)enc.data(), (std::streamsize)enc.size());
-        vfs::add_override(std::string("/") + rel, to_u8(dst));
-        LOGI("[lang] shutdown screen: DESLIGANDO...\n");
+        vfs::add_conditional_override(std::string("/") + rel, to_u8(dst), [datadir] { return console_lang_is_pt(datadir); });
+        LOGI("[lang] shutdown screen: DESLIGANDO... when the console is in Portuguese\n");
     }
 }
 
@@ -446,6 +448,6 @@ void apply_ptbr(const std::string& rootfs, const std::string& rundir, const std:
         }
     }
     if (files) LOGI("[lang] Português (Brasil): %d texts in %d menu files\n", values, files);
-    if (console_lang_is_pt(datadir)) apply_splash(root, outroot);
+    apply_splash(root, outroot, datadir);
 }
 }  // namespace lang

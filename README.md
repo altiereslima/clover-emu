@@ -206,7 +206,8 @@ then the home menu.
 | Fullscreen toggle  | `F11` / `Alt`+`Enter`          |                                |
 
 Player 1 is the keyboard plus the first gamepad; player 2 appears when a second gamepad
-is connected. On the NES, the top/left face buttons act as A/B too.
+is connected. On the NES the left face button (X on an Xbox pad) is A too, and the top one
+(Y) is B.
 
 Gamepads go through SDL's GameController layer: XInput pads (Xbox 360/One/Series and
 compatibles such as 8BitDo in X-input mode) as well as DualShock 4, DualSense and Switch Pro

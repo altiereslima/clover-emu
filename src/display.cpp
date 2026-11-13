@@ -587,8 +587,9 @@ static void handle_cbutton(const SDL_ControllerButtonEvent& b) {
         }
     }
     switch (b.button) {
-    case SDL_CONTROLLER_BUTTON_B: case SDL_CONTROLLER_BUTTON_Y: pb(A); break;
-    case SDL_CONTROLLER_BUTTON_A: case SDL_CONTROLLER_BUTTON_X: pb(B); break;
+    // NES: right / left face buttons = A, bottom / top = B
+    case SDL_CONTROLLER_BUTTON_B: case SDL_CONTROLLER_BUTTON_X: pb(A); break;
+    case SDL_CONTROLLER_BUTTON_A: case SDL_CONTROLLER_BUTTON_Y: pb(B); break;
     case SDL_CONTROLLER_BUTTON_BACK: pb(BACK); break;
     case SDL_CONTROLLER_BUTTON_START: pb(START); break;
     case SDL_CONTROLLER_BUTTON_DPAD_UP: pb(DUP); break;

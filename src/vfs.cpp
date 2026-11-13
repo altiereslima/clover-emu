@@ -34,8 +34,21 @@ const Mount* find_mount(const std::string& g) {
     return best;
 }
 
+// Single files replaced only while a condition holds (checked at every lookup), e.g. a translated
+// splash screen that depends on the language the console currently has saved.
+struct CondOverride {
+    std::string host;
+    std::function<bool()> active;
+};
+std::map<std::string, CondOverride> g_cond_overrides;
+
 // Exact-case overrides (stub libraries, case-colliding firmware paths). Matches whole subtrees.
 bool find_override(const std::string& g, std::string& host) {
+    if (!g_cond_overrides.empty())
+        if (auto it = g_cond_overrides.find(g); it != g_cond_overrides.end() && it->second.active()) {
+            host = it->second.host;
+            return true;
+        }
     for (auto& [k, v] : g_overrides) {
         if (g == k) {
             host = v;
@@ -262,6 +275,9 @@ namespace vfs {
 
 const std::string& rootfs() { return g_rootfs; }
 void add_override(const std::string& guest, const std::string& host) { g_overrides[guest] = host; }
+void add_conditional_override(const std::string& guest, const std::string& host, std::function<bool()> active) {
+    g_cond_overrides[guest] = {host, std::move(active)};
+}
 
 void init(const std::string& root, const std::string& datadir, const std::string& rundir) {
     g_rootfs = root;

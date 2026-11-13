@@ -129,6 +129,9 @@ int readlink(Thread& t, const std::string& path, std::string& out, int dirfd = l
 bool is_virtual_path(const std::string& guest);
 const std::string& rootfs();
 void add_override(const std::string& guest, const std::string& host);
+// Replace one file only while active() returns true (evaluated whenever the path is looked up).
+// Register before the guest starts.
+void add_conditional_override(const std::string& guest, const std::string& host, std::function<bool()> active);
 // read an entire guest file (for loader)
 bool read_file(Process& p, const std::string& path, std::vector<u8>& out, std::string* canonical = nullptr);
 }  // namespace vfs
